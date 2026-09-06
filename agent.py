@@ -60,12 +60,12 @@ def combine_labels(first, second):
 
 
 @dataclass(frozen=True)
-class HiddenVariable:
+class LabeledValue:
     value: str
     label: Label
 
 
-HIDDEN_VARIABLES: dict[str, HiddenVariable] = {}
+HIDDEN_VARIABLES: dict[str, LabeledValue] = {}
 VARIABLE_IDS = count(1)
 
 
@@ -96,12 +96,25 @@ def debug_label(event, reference, label):
 
 def hide(value, label, *, debug=False):
     reference = f"v{next(VARIABLE_IDS)}"
-    HIDDEN_VARIABLES[reference] = HiddenVariable(value, label)
+    HIDDEN_VARIABLES[reference] = LabeledValue(value, label)
 
     if debug:
         debug_label("stored", reference, label)
 
     return {"ref": reference}
+
+
+def prepare_result(result, call_label, *, expose=False, debug=False):
+    label = Label(
+        combine_labels(call_label, result.label).confidentiality,
+        result.label.integrity,
+    )
+
+    if label.integrity == Integrity.UNTRUSTED and not expose:
+        reference = hide(result.value, label, debug=debug)
+        return json.dumps(reference), Label(label.confidentiality, Integrity.TRUSTED)
+
+    return result.value, label
 
 
 def get_variable(ref):
@@ -127,7 +140,7 @@ def resolve(value, *, debug=False):
 
 
 TEXT_OR_REF = {
-    "description": "Literal text or a hidden-variable reference returned by read or quarantined_llm_call.",
+    "description": "Literal text or a hidden-variable reference returned by a tool.",
     "anyOf": [
         {"type": "string"},
         {
@@ -158,7 +171,7 @@ def tool_schema(name, description, **parameters):
 TOOLS = [
     tool_schema(
         "shell",
-        "Run a bash command in a fresh shell in the agent's working directory.",
+        "Run a bash command in a fresh shell. Returns a hidden reference to its exit code and output.",
         command={"type": "string"},
     ),
 
@@ -183,7 +196,7 @@ TOOLS = [
     ),
 
     tool_schema(
-        "quarantined_llm_call", "Ask a separate model to process a hidden value. Returns a new hidden reference.",
+        "quarantined_llm_call", "Ask a separate model to process a hidden value. Untrusted results return a hidden reference.",
         ref={"type": "string"}, query={"type": "string"},
     ),
 ]
@@ -192,13 +205,13 @@ TOOLS = [
 def read(path, *, debug=False):
     value = Path(resolve(path, debug=debug)).read_bytes().decode("utf-8")
 
-    return hide(value, Label(Confidentiality.PRIVATE, Integrity.UNTRUSTED), debug=debug)
+    return LabeledValue(value, PRIVATE_UNTRUSTED)
 
 
 def write(path, content, *, debug=False):
     Path(resolve(path, debug=debug)).write_bytes(resolve(content, debug=debug).encode("utf-8"))
 
-    return "Written."
+    return LabeledValue("Written.", PUBLIC_TRUSTED)
 
 
 def edit(path, old, new, *, debug=False):
@@ -214,7 +227,7 @@ def edit(path, old, new, *, debug=False):
 
     path.write_bytes(value.replace(old, new, 1).encode("utf-8"))
 
-    return "Edited."
+    return LabeledValue("Edited.", PUBLIC_TRUSTED)
 
 
 def shell(command):
@@ -229,9 +242,9 @@ def shell(command):
             timeout=60,
         )
 
-        return f"Exit code: {result.returncode}\n{result.stdout}"
+        return LabeledValue(f"Exit code: {result.returncode}\n{result.stdout}", PRIVATE_UNTRUSTED)
     except subprocess.TimeoutExpired:
-        return "Error: command timed out after 60 seconds."
+        return LabeledValue("Error: command timed out after 60 seconds.", PRIVATE_UNTRUSTED)
 
 
 def inspect(ref, *, debug=False):
@@ -269,7 +282,7 @@ def quarantined_llm_call(ref, query, *, client, conversation_label, debug=False)
     if response.status != "completed" or not response.output_text:
         raise ValueError("Helper returned no completed text.")
 
-    return hide(response.output_text, label, debug=debug)
+    return LabeledValue(response.output_text, label)
 
 
 TOOL_FUNCTIONS = {
@@ -280,7 +293,7 @@ TOOL_FUNCTIONS = {
 
 TOOL_POLICIES = {
     "shell": {"command": PUBLIC_TRUSTED},
-    "read": {"path": PRIVATE_TRUSTED},
+    "read": {"path": PRIVATE_UNTRUSTED},
     "write": {"path": PRIVATE_TRUSTED, "content": PRIVATE_UNTRUSTED},
     "edit": {"path": PRIVATE_TRUSTED, "old": PRIVATE_UNTRUSTED, "new": PRIVATE_UNTRUSTED},
     "inspect": {"ref": PRIVATE_UNTRUSTED},
@@ -317,17 +330,15 @@ def check_tool_policy(name, arguments, conversation_label):
 
 def run_tool(name, arguments, *, client, conversation_label, debug=False):
 
-    message_label = Label(Confidentiality.PUBLIC, Integrity.TRUSTED)
+    call_label = conversation_label
 
     try:
         if name not in TOOL_FUNCTIONS:
             raise ValueError(f"Unknown tool: {name}")
 
         call_label = check_tool_policy(name, arguments, conversation_label)
-        message_label = Label(call_label.confidentiality, Integrity.TRUSTED)
 
         if name == "shell":
-            message_label = Label(Confidentiality.PRIVATE, Integrity.UNTRUSTED)
             result = shell(**arguments)
         elif name == "quarantined_llm_call":
             result = quarantined_llm_call(
@@ -336,23 +347,14 @@ def run_tool(name, arguments, *, client, conversation_label, debug=False):
         else:
             result = TOOL_FUNCTIONS[name](**arguments, debug=debug)
 
-        if isinstance(result, HiddenVariable):
-            message_label = result.label
-            result = result.value
-
-        elif isinstance(result, dict):
-            variable = HIDDEN_VARIABLES[result["ref"]]
-
-            message_label = Label(variable.label.confidentiality, Integrity.TRUSTED)
-            result = json.dumps(result)
     except PolicyError as error:
-        result = f"Blocked by IFC: {error}"
+        result = LabeledValue(f"Blocked by IFC: {error}", PUBLIC_TRUSTED)
     except (OSError, UnicodeError, OpenAIError) as error:
-        result = f"Error: {type(error).__name__}"
+        result = LabeledValue(f"Error: {type(error).__name__}", PUBLIC_TRUSTED)
     except (TypeError, ValueError) as error:
-        result = f"Error: {error}"
+        result = LabeledValue(f"Error: {error}", PUBLIC_TRUSTED)
 
-    return result, message_label
+    return prepare_result(result, call_label, expose=name == "inspect", debug=debug)
 
 
 def main():
@@ -392,16 +394,17 @@ def main():
                 model=os.environ.get("OPENAI_MODEL", "gpt-5.4-mini"),
                 instructions=(
                     "You are a helpful coding agent. Use read, write, and edit for file operations, "
-                    "and shell for commands. read and quarantined_llm_call return hidden references such as "
+                    "and shell for commands. Untrusted tool results are hidden behind references such as "
                     '{"ref":"v1"}. Pass that object as a file-tool argument to reuse its text. '
                     'The string "v1" is literal text, not a reference. '
-                    "You have not seen a hidden value's contents just because read succeeded. "
+                    "You have not seen a hidden value's contents just because a tool succeeded. "
                     "Use quarantined_llm_call(ref='v1', query='...') to summarize or extract hidden data "
                     "when you can pass the result to another tool without reading it yourself. "
-                    "The helper has no tools and returns another reference with inherited labels. "
+                    "The helper has no tools; its answer inherits labels and is hidden if untrusted. "
                     "Use inspect(ref='v1') when you need to see the text to reason about it "
                     "or answer the user. Inspecting untrusted text makes the conversation untrusted. "
-                    "File paths require trusted input, so inspecting untrusted text blocks further file tools. "
+                    "read accepts untrusted paths and remains available after inspection. "
+                    "write and edit require trusted paths, so an untrusted conversation cannot modify files. "
                     "Shell requires a public, trusted conversation. Reading a private file blocks shell. "
                     "Complete file changes before inspecting untrusted results. "
                     "If IFC blocks an action, explain the restriction and do not try to bypass it. "
