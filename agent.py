@@ -28,6 +28,25 @@ class Label:
     integrity: Integrity
 
 
+PUBLIC_TRUSTED = Label(Confidentiality.PUBLIC, Integrity.TRUSTED)
+PRIVATE_TRUSTED = Label(Confidentiality.PRIVATE, Integrity.TRUSTED)
+PRIVATE_UNTRUSTED = Label(Confidentiality.PRIVATE, Integrity.UNTRUSTED)
+
+MODEL_CLEARANCE = PRIVATE_UNTRUSTED
+
+
+class PolicyError(Exception):
+    pass
+
+
+def require_flow(source, destination, target):
+    if source.confidentiality == Confidentiality.PRIVATE and destination.confidentiality == Confidentiality.PUBLIC:
+        raise PolicyError(f"{target} cannot receive private data.")
+
+    if source.integrity == Integrity.UNTRUSTED and destination.integrity == Integrity.TRUSTED:
+        raise PolicyError(f"{target} requires trusted input.")
+
+
 def combine_labels(first, second):
     return Label(
         Confidentiality.PRIVATE
@@ -108,7 +127,7 @@ def resolve(value, *, debug=False):
 
 
 TEXT_OR_REF = {
-    "description": "Literal text or a hidden-variable reference returned by read or query_llm.",
+    "description": "Literal text or a hidden-variable reference returned by read or quarantined_llm_call.",
     "anyOf": [
         {"type": "string"},
         {
@@ -164,7 +183,7 @@ TOOLS = [
     ),
 
     tool_schema(
-        "query_llm", "Ask a separate model to process a hidden value. Returns a new hidden reference.",
+        "quarantined_llm_call", "Ask a separate model to process a hidden value. Returns a new hidden reference.",
         ref={"type": "string"}, query={"type": "string"},
     ),
 ]
@@ -224,10 +243,13 @@ def inspect(ref, *, debug=False):
     return variable
 
 
-def query_llm(ref, query, *, client, conversation_label, debug=False):
+def quarantined_llm_call(ref, query, *, client, conversation_label, debug=False):
     variable = get_variable(ref)
     if not isinstance(query, str):
         raise ValueError("query must be text.")
+
+    label = combine_labels(variable.label, conversation_label)
+    require_flow(label, MODEL_CLEARANCE, "OpenAI helper")
 
     if debug:
         debug_label("querying", ref, variable.label)
@@ -247,14 +269,50 @@ def query_llm(ref, query, *, client, conversation_label, debug=False):
     if response.status != "completed" or not response.output_text:
         raise ValueError("Helper returned no completed text.")
 
-    label = combine_labels(variable.label, conversation_label)
     return hide(response.output_text, label, debug=debug)
 
 
 TOOL_FUNCTIONS = {
     "read": read, "write": write, "edit": edit, "shell": shell,
-    "inspect": inspect, "query_llm": query_llm,
+    "inspect": inspect, "quarantined_llm_call": quarantined_llm_call,
 }
+
+
+TOOL_POLICIES = {
+    "shell": {"command": PUBLIC_TRUSTED},
+    "read": {"path": PRIVATE_TRUSTED},
+    "write": {"path": PRIVATE_TRUSTED, "content": PRIVATE_UNTRUSTED},
+    "edit": {"path": PRIVATE_TRUSTED, "old": PRIVATE_UNTRUSTED, "new": PRIVATE_UNTRUSTED},
+    "inspect": {"ref": PRIVATE_UNTRUSTED},
+    "quarantined_llm_call": {"ref": PRIVATE_UNTRUSTED, "query": PRIVATE_UNTRUSTED},
+}
+
+
+def check_tool_policy(name, arguments, conversation_label):
+    policy = TOOL_POLICIES[name]
+    call_label = conversation_label
+
+    if not isinstance(arguments, dict) or set(arguments) != set(policy):
+        raise ValueError(f"Invalid arguments for {name}.")
+
+    if name in ("shell", "inspect", "quarantined_llm_call") and not all(isinstance(value, str) for value in arguments.values()):
+        raise ValueError(f"{name} arguments must be text.")
+
+    for parameter, destination in policy.items():
+        value = arguments[parameter]
+        source = conversation_label
+
+        if parameter == "ref":
+            source = combine_labels(source, get_variable(value).label)
+        elif not isinstance(value, str):
+            if not isinstance(value, dict) or set(value) != {"ref"}:
+                raise ValueError('Expected literal text or a reference like {"ref":"v1"}.')
+            source = combine_labels(source, get_variable(value["ref"]).label)
+
+        require_flow(source, destination, f"{name}.{parameter}")
+        call_label = combine_labels(call_label, source)
+
+    return call_label
 
 
 def run_tool(name, arguments, *, client, conversation_label, debug=False):
@@ -265,11 +323,14 @@ def run_tool(name, arguments, *, client, conversation_label, debug=False):
         if name not in TOOL_FUNCTIONS:
             raise ValueError(f"Unknown tool: {name}")
 
+        call_label = check_tool_policy(name, arguments, conversation_label)
+        message_label = Label(call_label.confidentiality, Integrity.TRUSTED)
+
         if name == "shell":
             message_label = Label(Confidentiality.PRIVATE, Integrity.UNTRUSTED)
             result = shell(**arguments)
-        elif name == "query_llm":
-            result = query_llm(
+        elif name == "quarantined_llm_call":
+            result = quarantined_llm_call(
                 **arguments, client=client, conversation_label=conversation_label, debug=debug,
             )
         else:
@@ -284,6 +345,8 @@ def run_tool(name, arguments, *, client, conversation_label, debug=False):
 
             message_label = Label(variable.label.confidentiality, Integrity.TRUSTED)
             result = json.dumps(result)
+    except PolicyError as error:
+        result = f"Blocked by IFC: {error}"
     except (OSError, UnicodeError, OpenAIError) as error:
         result = f"Error: {type(error).__name__}"
     except (TypeError, ValueError) as error:
@@ -319,19 +382,29 @@ def main():
         history.append({"role": "user", "content": prompt})
 
         while True:
+            try:
+                require_flow(conversation_label, MODEL_CLEARANCE, "OpenAI conversation")
+            except PolicyError as error:
+                print(color(f"Blocked by IFC: {error}", "2;31", stream=sys.stderr), file=sys.stderr)
+                return
+
             response = client.responses.create(
                 model=os.environ.get("OPENAI_MODEL", "gpt-5.4-mini"),
                 instructions=(
                     "You are a helpful coding agent. Use read, write, and edit for file operations, "
-                    "and shell for commands. read and query_llm return hidden references such as "
+                    "and shell for commands. read and quarantined_llm_call return hidden references such as "
                     '{"ref":"v1"}. Pass that object as a file-tool argument to reuse its text. '
                     'The string "v1" is literal text, not a reference. '
                     "You have not seen a hidden value's contents just because read succeeded. "
-                    "Use query_llm(ref='v1', query='...') to summarize or extract hidden data "
+                    "Use quarantined_llm_call(ref='v1', query='...') to summarize or extract hidden data "
                     "when you can pass the result to another tool without reading it yourself. "
                     "The helper has no tools and returns another reference with inherited labels. "
                     "Use inspect(ref='v1') when you need to see the text to reason about it "
                     "or answer the user. Inspecting untrusted text makes the conversation untrusted. "
+                    "File paths require trusted input, so inspecting untrusted text blocks further file tools. "
+                    "Shell requires a public, trusted conversation. Reading a private file blocks shell. "
+                    "Complete file changes before inspecting untrusted results. "
+                    "If IFC blocks an action, explain the restriction and do not try to bypass it. "
                     "You cannot infer a hidden value's contents from its reference."
                 ),
                 tools=TOOLS,
@@ -359,7 +432,8 @@ def main():
                     call.name, arguments, client=client,
                     conversation_label=conversation_label, debug=debug,
                 )
-                tool_line(f"output: {output}")
+                displayed_output = color(output, "2;31", stream=sys.stderr) if output.startswith("Blocked by IFC:") else output
+                tool_line(f"output: {displayed_output}")
 
                 history.append({
                     "type": "function_call_output",
