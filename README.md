@@ -27,8 +27,10 @@ labels. Run `.venv/bin/python agent.py --debug` to include dim IFC labels:
 ```text
 ┌─ read
 │ input: {"path": "agent.py"}
+│ [ifc] conversation before  confidentiality=public  integrity=trusted
 │ [ifc] stored v1  confidentiality=private  integrity=untrusted
 │ output: {"ref": "v1"}
+│ [ifc] conversation after  confidentiality=private  integrity=trusted
 └─
 
 Assistant
@@ -39,7 +41,16 @@ Tool activity goes to stderr; assistant replies go to stdout. Debug lines show
 references and labels, without hidden contents. Redirected output uses plain
 text; set `NO_COLOR=1` to disable terminal colors.
 
-Reads currently receive a fixed private/untrusted label. Labels are stored with
-hidden values; label propagation and policy enforcement are not implemented yet.
-Shell output remains visible to the model, and shell commands have ordinary host
-access. This is a playground for reference handling, not an IFC sandbox.
+The conversation label lives alongside its history and starts public/trusted.
+Each tool response contributes a label: combining labels keeps either private or
+untrusted once present. Later user messages and assistant replies do not reset it.
+
+Reads store private/untrusted text behind references. Following Microsoft's
+conservative accounting, these hidden results raise the conversation's
+confidentiality to private while preserving its integrity. Shell output is
+visible and labeled private/untrusted because commands can read arbitrary files.
+Fixed write/edit acknowledgments and sanitized file errors are public/trusted;
+they cannot lower an existing conversation label.
+
+This step tracks labels only. Tool-policy checks and an `inspect` tool are still
+to come. Shell commands retain ordinary host access; this is not an IFC sandbox.
