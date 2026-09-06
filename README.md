@@ -25,19 +25,6 @@ Set `OPENAI_API_KEY`; `OPENAI_MODEL` is optional. Run either agent:
 .venv/bin/python agent_useful_for_coding.py --workspace . --debug
 ```
 
-`--debug` shows dim, colored IFC labels. `--workspace .` allows editing this
-repo, including the agent itself. Type `/quit` to exit.
-
-Tools: `read`, `write`, `edit`, `shell`, `inspect`, and `quarantined_llm_call`.
-Untrusted values normally stay behind references. `inspect` exposes them and makes the
-conversation untrusted; helper processing preserves their labels. The coding
-agent's `/import PATH` command loads outside text as an untrusted reference,
-which cannot be written into the approved workspace.
-
-Outside `read` calls ask you to deny, read as untrusted (blocking later edits and
-shell calls), or trust that read. Both reads stay private. Approval grants one
-file read; it does not expand shell access or clear earlier untrusted input.
-
 This is a research playground. The coding agent trusts the approved tree and
 host; it does not track another process putting outside content into that tree.
 OpenAI is allowed to receive private data. The sandbox limits access, but does
