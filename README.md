@@ -21,6 +21,24 @@ turns until the process exits. The string `"v1"` is literal text; references are
 never expanded inside strings or recursively inside stored values. References
 are resolved and edit matches are checked before any file is changed.
 
+The CLI separates tool calls into small boxes, with colored `You` and `Assistant`
+labels. Run `.venv/bin/python agent.py --debug` to include dim IFC labels:
+
+```text
+┌─ read
+│ input: {"path": "agent.py"}
+│ [ifc] stored v1  confidentiality=private  integrity=untrusted
+│ output: {"ref": "v1"}
+└─
+
+Assistant
+The file is stored as reference v1.
+```
+
+Tool activity goes to stderr; assistant replies go to stdout. Debug lines show
+references and labels, without hidden contents. Redirected output uses plain
+text; set `NO_COLOR=1` to disable terminal colors.
+
 Reads currently receive a fixed private/untrusted label. Labels are stored with
 hidden values; label propagation and policy enforcement are not implemented yet.
 Shell output remains visible to the model, and shell commands have ordinary host

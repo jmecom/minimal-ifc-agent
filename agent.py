@@ -1,6 +1,8 @@
+import argparse
 import json
 import os
 import subprocess
+import sys
 from dataclasses import dataclass
 from enum import Enum
 from itertools import count
@@ -35,20 +37,47 @@ HIDDEN_VARIABLES: dict[str, HiddenVariable] = {}
 VARIABLE_IDS = count(1)
 
 
-def hide(value, label):
+def color(text, style, *, stream=None):
+    stream = sys.stdout if stream is None else stream
+    if stream.isatty() and not os.environ.get("NO_COLOR"):
+        return f"\033[{style}m{text}\033[0m"
+    return text
+
+
+def tool_line(text):
+    for line in text.splitlines():
+        print(color("│ ", "2;90", stream=sys.stderr) + line, file=sys.stderr, flush=True)
+
+
+def debug_label(event, reference, label):
+    confidentiality_color = "2;35" if label.confidentiality == Confidentiality.PRIVATE else "2;36"
+    integrity_color = "2;33" if label.integrity == Integrity.UNTRUSTED else "2;32"
+    tool_line(
+        color(f"[ifc] {event} {reference}  ", "2", stream=sys.stderr)
+        + color(f"confidentiality={label.confidentiality.value}  ", confidentiality_color, stream=sys.stderr)
+        + color(f"integrity={label.integrity.value}", integrity_color, stream=sys.stderr)
+    )
+
+
+def hide(value, label, *, debug=False):
     reference = f"v{next(VARIABLE_IDS)}"
     HIDDEN_VARIABLES[reference] = HiddenVariable(value, label)
+    if debug:
+        debug_label("stored", reference, label)
     return {"ref": reference}
 
 
-def resolve(value):
+def resolve(value, *, debug=False):
     if isinstance(value, str):
         return value
     if not isinstance(value, dict) or set(value) != {"ref"} or not isinstance(value["ref"], str):
         raise ValueError('Expected literal text or a reference like {"ref":"v1"}.')
     if value["ref"] not in HIDDEN_VARIABLES:
         raise ValueError(f"Unknown reference: {value['ref']}")
-    return HIDDEN_VARIABLES[value["ref"]].value
+    variable = HIDDEN_VARIABLES[value["ref"]]
+    if debug:
+        debug_label("resolved", value["ref"], variable.label)
+    return variable.value
 
 
 TEXT_OR_REF = {
@@ -101,20 +130,20 @@ TOOLS = [
 ]
 
 
-def read(path):
-    value = Path(resolve(path)).read_bytes().decode("utf-8")
+def read(path, *, debug=False):
+    value = Path(resolve(path, debug=debug)).read_bytes().decode("utf-8")
     # Until file labeling is configured, treat every read as private and untrusted.
-    return hide(value, Label(Confidentiality.PRIVATE, Integrity.UNTRUSTED))
+    return hide(value, Label(Confidentiality.PRIVATE, Integrity.UNTRUSTED), debug=debug)
 
 
-def write(path, content):
-    Path(resolve(path)).write_bytes(resolve(content).encode("utf-8"))
+def write(path, content, *, debug=False):
+    Path(resolve(path, debug=debug)).write_bytes(resolve(content, debug=debug).encode("utf-8"))
     return "Written."
 
 
-def edit(path, old, new):
-    path = Path(resolve(path))
-    old, new = resolve(old), resolve(new)
+def edit(path, old, new, *, debug=False):
+    path = Path(resolve(path, debug=debug))
+    old, new = resolve(old, debug=debug), resolve(new, debug=debug)
     if not old:
         raise ValueError("old must not be empty.")
     value = path.read_bytes().decode("utf-8")
@@ -125,7 +154,6 @@ def edit(path, old, new):
 
 
 def shell(command):
-    print(f"$ {command}", flush=True)
     try:
         result = subprocess.run(
             ["bash", "-c", command],
@@ -144,11 +172,14 @@ def shell(command):
 TOOL_FUNCTIONS = {"read": read, "write": write, "edit": edit, "shell": shell}
 
 
-def run_tool(name, arguments):
+def run_tool(name, arguments, *, debug=False):
     try:
         if name not in TOOL_FUNCTIONS:
             raise ValueError(f"Unknown tool: {name}")
-        result = TOOL_FUNCTIONS[name](**arguments)
+        if name == "shell":
+            result = shell(**arguments)
+        else:
+            result = TOOL_FUNCTIONS[name](**arguments, debug=debug)
         return json.dumps(result) if isinstance(result, dict) else result
     except (OSError, UnicodeError) as error:
         # File errors can contain paths or bytes obtained from hidden variables.
@@ -158,13 +189,19 @@ def run_tool(name, arguments):
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Minimal agent with hidden-variable references.")
+    parser.add_argument(
+        "--debug", action="store_true",
+        help="Show IFC labels when hidden variables are stored or resolved.",
+    )
+    debug = parser.parse_args().debug
     if not os.environ.get("OPENAI_API_KEY"):
         raise SystemExit("Set OPENAI_API_KEY before running the agent.")
     client = OpenAI()
     history = []
 
     while True:
-        prompt = input("You: ").strip()
+        prompt = input(color("\nYou: ", "1;32")).strip()
         if prompt == "/quit":
             return
         if not prompt:
@@ -186,13 +223,17 @@ def main():
             )
             history.extend(response.output)
             if response.output_text:
-                print(response.output_text)
+                print(f"\n{color('Assistant', '1;36')}\n{response.output_text}", flush=True)
             calls = [item for item in response.output if item.type == "function_call"]
             if not calls:
                 break
             for call in calls:
-                output = run_tool(call.name, json.loads(call.arguments))
-                print(f"{call.name}: {output}")
+                arguments = json.loads(call.arguments)
+                print(color(f"\n┌─ {call.name}", "2;36", stream=sys.stderr), file=sys.stderr, flush=True)
+                tool_line(f"input: {json.dumps(arguments, ensure_ascii=False)}")
+                output = run_tool(call.name, arguments, debug=debug)
+                tool_line(f"output: {output}")
+                print(color("└─", "2;36", stream=sys.stderr), file=sys.stderr, flush=True)
                 history.append({
                     "type": "function_call_output",
                     "call_id": call.call_id,
