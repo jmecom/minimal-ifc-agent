@@ -1,6 +1,7 @@
 # minimal ifc agent
 
 Minimal agent, inspired by [Gollum](https://github.com/ddz/gollum), but that implements fides-style information flow control.
+For a more complete and useful IFC-capable agent, see my other project, [pi-ifc](https://github.com/jmecom/pi-ifc).
 
 - [agent_basic.py](agent_basic.py): file reads and shell output are untrusted and hidden.
   Its shell has normal host access.
