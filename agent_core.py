@@ -1,14 +1,12 @@
-import argparse
 import json
+import logging
 import os
 import subprocess
-import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from itertools import count
-from pathlib import Path
 
-from openai import OpenAI, OpenAIError
+from openai import OpenAIError
 
 
 class Confidentiality(Enum):
@@ -66,53 +64,31 @@ class LabeledValue:
 
 HIDDEN_VARIABLES: dict[str, LabeledValue] = {}
 VARIABLE_IDS = count(1)
+LOG = logging.getLogger("ifc")
 
 
-def color(text, style, *, stream=None):
-    stream = sys.stdout if stream is None else stream
-
-    if stream.isatty() and not os.environ.get("NO_COLOR"):
-        return f"\033[{style}m{text}\033[0m"
-
-    return text
+def trace(event, reference, label):
+    LOG.debug("%s %s", event, reference, extra={"label": label})
 
 
-def tool_line(text):
-    for line in text.splitlines():
-        print(color("│ ", "2;90", stream=sys.stderr) + line, file=sys.stderr, flush=True)
-
-
-def debug_label(event, reference, label):
-    confidentiality_color = "2;35" if label.confidentiality == Confidentiality.PRIVATE else "2;36"
-    integrity_color = "2;33" if label.integrity == Integrity.UNTRUSTED else "2;32"
-
-    tool_line(
-        color(f"[ifc] {event} {reference}  ", "2", stream=sys.stderr)
-        + color(f"confidentiality={label.confidentiality.value}  ", confidentiality_color, stream=sys.stderr)
-        + color(f"integrity={label.integrity.value}", integrity_color, stream=sys.stderr)
-    )
-
-
-def hide(value, label, *, debug=False):
+def hide(value, label):
     reference = f"v{next(VARIABLE_IDS)}"
     HIDDEN_VARIABLES[reference] = LabeledValue(value, label)
-
-    if debug:
-        debug_label("stored", reference, label)
+    trace("stored", reference, label)
 
     return {"ref": reference}
 
 
-def prepare_result(result, call_label, *, inherit_call_integrity=False, expose=False, debug=False):
+def prepare_result(result, call_label, *, inherit_call_integrity=False):
     label = combine_labels(call_label, result.label)
     if not inherit_call_integrity:
         label = Label(label.confidentiality, result.label.integrity)
 
-    if label.integrity == Integrity.UNTRUSTED and not (expose or result.expose):
-        reference = hide(result.value, label, debug=debug)
-        return json.dumps(reference), Label(label.confidentiality, Integrity.TRUSTED)
+    if label.integrity == Integrity.UNTRUSTED and not result.expose:
+        reference = hide(result.value, label)
+        return LabeledValue(json.dumps(reference), Label(label.confidentiality, Integrity.TRUSTED))
 
-    return result.value, label
+    return LabeledValue(result.value, label)
 
 
 def get_variable(ref):
@@ -124,17 +100,16 @@ def get_variable(ref):
     return HIDDEN_VARIABLES[ref]
 
 
-def resolve(value, *, debug=False):
+def resolve(value):
     if isinstance(value, str):
-        return value
+        return LabeledValue(value, PUBLIC_TRUSTED)
 
     if not isinstance(value, dict) or set(value) != {"ref"} or not isinstance(value["ref"], str):
         raise ValueError('Expected literal text or a reference like {"ref":"v1"}.')
     variable = get_variable(value["ref"])
-    if debug:
-        debug_label("resolved", value["ref"], variable.label)
+    trace("resolved", value["ref"], variable.label)
 
-    return variable.value
+    return variable
 
 
 TEXT_OR_REF = {
@@ -201,25 +176,18 @@ def make_tools(*, shell_description, read_description):
     ]
 
 
-def inspect(ref, *, debug=False):
+def inspect(ref):
     variable = get_variable(ref)
+    trace("inspected", ref, variable.label)
 
-    if debug:
-        debug_label("inspected", ref, variable.label)
-
-    return variable
+    return replace(variable, expose=True)
 
 
-def quarantined_llm_call(ref, query, *, client, conversation_label, debug=False):
+def quarantined_llm_call(ref, query, *, client, conversation_label):
     variable = get_variable(ref)
-    if not isinstance(query, str):
-        raise ValueError("query must be text.")
-
     label = combine_labels(variable.label, conversation_label)
     require_flow(label, MODEL_CLEARANCE, "OpenAI helper")
-
-    if debug:
-        debug_label("querying", ref, variable.label)
+    trace("querying", ref, variable.label)
 
     response = client.responses.create(
         model=os.environ.get("OPENAI_MODEL", "gpt-5.4-mini"),
@@ -243,27 +211,20 @@ REFERENCE_TOOLS = {"inspect": inspect, "quarantined_llm_call": quarantined_llm_c
 
 
 REFERENCE_INSTRUCTIONS = (
-    '{"ref":"v1"}. Pass that object as a file-tool argument to reuse its text. '
-    'The string "v1" is literal text, not a reference. '
-    "You have not seen a hidden value's contents just because a tool succeeded. "
-    "Use quarantined_llm_call(ref='v1', query='...') to summarize or extract hidden data "
-    "when you can pass the result to another tool without reading it yourself. "
+    'Hidden results look like {"ref":"v1"}. Pass that object to file tools to reuse its text; '
+    'the string "v1" is literal text. You have not seen the hidden contents. '
+    "Use quarantined_llm_call(ref='v1', query='...') to process hidden text without reading it. "
     "The helper has no tools; its answer inherits labels and is hidden if untrusted. "
-    "Use inspect(ref='v1') when you need to see the text to reason about it "
-    "or answer the user. Inspecting untrusted text makes the conversation untrusted. "
-    "read accepts untrusted paths and remains available after inspection. "
+    "Use inspect(ref='v1') to see the text and reason about it or answer the user. "
+    "Inspecting untrusted text makes the conversation untrusted. read remains available. "
+    "If IFC blocks an action, explain why and do not try to bypass it."
 )
 
 
-BLOCKED_INSTRUCTIONS = (
-    "If IFC blocks an action, explain the restriction and do not try to bypass it. "
-    "You cannot infer a hidden value's contents from its reference."
-)
-
-
-def check_tool_policy(name, arguments, conversation_label, policies):
+def prepare_call(name, arguments, conversation_label, policies):
     policy = policies[name]
     call_label = conversation_label
+    resolved = {}
 
     if not isinstance(arguments, dict) or set(arguments) != set(policy):
         raise ValueError(f"Invalid arguments for {name}.")
@@ -273,19 +234,20 @@ def check_tool_policy(name, arguments, conversation_label, policies):
 
     for parameter, destination in policy.items():
         value = arguments[parameter]
-        source = conversation_label
-
-        if parameter == "ref":
-            source = combine_labels(source, get_variable(value).label)
-        elif not isinstance(value, str):
-            if not isinstance(value, dict) or set(value) != {"ref"}:
-                raise ValueError('Expected literal text or a reference like {"ref":"v1"}.')
-            source = combine_labels(source, get_variable(value["ref"]).label)
-
+        variable = get_variable(value) if parameter == "ref" else resolve(value)
+        source = combine_labels(conversation_label, variable.label)
         require_flow(source, destination, f"{name}.{parameter}")
+
+        resolved[parameter] = value if parameter == "ref" else variable.value
         call_label = combine_labels(call_label, source)
 
-    return call_label
+    return resolved, call_label
+
+
+@dataclass(frozen=True)
+class ToolCall:
+    name: str
+    arguments: dict
 
 
 @dataclass
@@ -295,137 +257,73 @@ class Agent:
     tool_policies: dict
     instructions: str
     inherit_call_integrity: bool = False
-    allow_import: bool = False
+    history: list = field(default_factory=list, init=False)
+    conversation_label: Label = field(default=PUBLIC_TRUSTED, init=False)
 
-    def run_tool(self, name, arguments, *, client, conversation_label, debug=False):
+    def __post_init__(self):
+        assert {tool["name"] for tool in self.tools} == self.tool_functions.keys() == self.tool_policies.keys(), (
+            "Each tool needs a schema, a function, and a policy."
+        )
+
+    def run_tool(self, name, arguments, *, client, conversation_label):
         call_label = conversation_label
-        expose = name == "inspect"
 
         try:
             if name not in self.tool_functions:
                 raise ValueError(f"Unknown tool: {name}")
 
-            call_label = check_tool_policy(name, arguments, conversation_label, self.tool_policies)
+            arguments, call_label = prepare_call(name, arguments, conversation_label, self.tool_policies)
 
             if name == "quarantined_llm_call":
-                result = self.tool_functions[name](
-                    **arguments, client=client, conversation_label=conversation_label, debug=debug,
-                )
-            else:
-                result = self.tool_functions[name](**arguments, debug=debug)
+                arguments = {**arguments, "client": client, "conversation_label": conversation_label}
+            result = self.tool_functions[name](**arguments)
 
         except PolicyError as error:
-            result = LabeledValue(f"Blocked by IFC: {error}", PUBLIC_TRUSTED)
-            expose = True
+            result = LabeledValue(f"Blocked by IFC: {error}", PUBLIC_TRUSTED, expose=True)
         except (OSError, UnicodeError, OpenAIError) as error:
-            result = LabeledValue(f"Error: {type(error).__name__}", PUBLIC_TRUSTED)
-            expose = True
+            # These exceptions may contain paths or bytes from hidden values.
+            result = LabeledValue(f"Error: {type(error).__name__}", PUBLIC_TRUSTED, expose=True)
         except (TypeError, ValueError) as error:
-            result = LabeledValue(f"Error: {error}", PUBLIC_TRUSTED)
-            expose = True
+            result = LabeledValue(f"Error: {error}", PUBLIC_TRUSTED, expose=True)
         except subprocess.TimeoutExpired:
-            result = LabeledValue("Error: sandboxed tool timed out after 60 seconds.", PRIVATE_TRUSTED)
-            expose = True
+            result = LabeledValue("Error: sandboxed tool timed out after 60 seconds.", PRIVATE_TRUSTED, expose=True)
 
+        assert isinstance(result, LabeledValue), "Tools must return labeled results."
         return prepare_result(
             result, call_label, inherit_call_integrity=self.inherit_call_integrity,
-            expose=expose, debug=debug,
         )
 
-    def chat(self, *, debug=False):
-        client = OpenAI()
-
-        history = []
-        conversation_label = Label(Confidentiality.PUBLIC, Integrity.TRUSTED)
+    def respond(self, prompt, client):
+        """Yield assistant text, then a ToolCall and LabeledValue for each tool."""
+        self.history.append({"role": "user", "content": prompt})
 
         while True:
-            prompt = input(color("\nYou: ", "1;32")).strip()
+            require_flow(self.conversation_label, MODEL_CLEARANCE, "OpenAI conversation")
+            response = client.responses.create(
+                model=os.environ.get("OPENAI_MODEL", "gpt-5.4-mini"),
+                instructions=self.instructions,
+                tools=self.tools,
+                input=self.history,
+            )
+            self.history.extend(response.output)
 
-            if prompt == "/quit":
+            if response.output_text:
+                yield response.output_text
+
+            calls = [item for item in response.output if item.type == "function_call"]
+            if not calls:
                 return
-            if not prompt:
-                continue
 
-            if self.allow_import and prompt.startswith("/import "):
-                try:
-                    value = Path(prompt.removeprefix("/import ")).expanduser().read_bytes().decode("utf-8")
-                except (OSError, UnicodeError) as error:
-                    print(f"Import failed: {type(error).__name__}", file=sys.stderr)
-                    continue
-
-                reference = hide(value, PRIVATE_UNTRUSTED, debug=debug)
-                conversation_label = combine_labels(conversation_label, PRIVATE_TRUSTED)
-                history.append({"role": "user", "content": f"I imported untrusted text as {json.dumps(reference)}."})
-                print(f"Imported {json.dumps(reference)} as private/untrusted. It is outside the workspace.")
-                continue
-
-            history.append({"role": "user", "content": prompt})
-
-            while True:
-                try:
-                    require_flow(conversation_label, MODEL_CLEARANCE, "OpenAI conversation")
-                except PolicyError as error:
-                    print(color(f"Blocked by IFC: {error}", "2;31", stream=sys.stderr), file=sys.stderr)
-                    return
-
-                response = client.responses.create(
-                    model=os.environ.get("OPENAI_MODEL", "gpt-5.4-mini"),
-                    instructions=self.instructions,
-                    tools=self.tools,
-                    input=history,
+            for call in calls:
+                arguments = json.loads(call.arguments)
+                yield ToolCall(call.name, arguments)
+                result = self.run_tool(
+                    call.name, arguments, client=client, conversation_label=self.conversation_label,
                 )
-
-                history.extend(response.output)
-
-                if response.output_text:
-                    print(f"\n{color('Assistant', '1;36')}\n{response.output_text}", flush=True)
-
-                calls = [item for item in response.output if item.type == "function_call"]
-                if not calls:
-                    break
-
-                for call in calls:
-                    arguments = json.loads(call.arguments)
-
-                    print(color(f"\n┌─ {call.name}", "2;36", stream=sys.stderr), file=sys.stderr, flush=True)
-                    tool_line(f"input: {json.dumps(arguments, ensure_ascii=False)}")
-                    if debug:
-                        debug_label("conversation", "before", conversation_label)
-
-                    output, message_label = self.run_tool(
-                        call.name, arguments, client=client,
-                        conversation_label=conversation_label, debug=debug,
-                    )
-                    displayed_output = color(output, "2;31", stream=sys.stderr) if output.startswith("Blocked by IFC:") else output
-                    tool_line(f"output: {displayed_output}")
-
-                    history.append({
-                        "type": "function_call_output",
-                        "call_id": call.call_id,
-                        "output": output,
-                    })
-
-                    conversation_label = combine_labels(conversation_label, message_label)
-
-                    if debug:
-                        debug_label("conversation", "after", conversation_label)
-                    print(color("└─", "2;36", stream=sys.stderr), file=sys.stderr, flush=True)
-
-
-def parse_arguments(description, *, workspace=False):
-    parser = argparse.ArgumentParser(description=description)
-    if workspace:
-        parser.add_argument(
-            "--workspace", required=True, type=Path,
-            help="Approve this directory's contents and allow sandboxed edits in place.",
-        )
-    parser.add_argument(
-        "--debug", action="store_true",
-        help="Show hidden-variable labels and the conversation label before and after tools.",
-    )
-    arguments = parser.parse_args()
-
-    if not os.environ.get("OPENAI_API_KEY"):
-        raise SystemExit("Set OPENAI_API_KEY before running the agent.")
-
-    return arguments
+                self.history.append({
+                    "type": "function_call_output",
+                    "call_id": call.call_id,
+                    "output": result.value,
+                })
+                self.conversation_label = combine_labels(self.conversation_label, result.label)
+                yield result

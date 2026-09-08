@@ -9,6 +9,7 @@ from functools import partial
 from pathlib import Path
 
 import agent_core as core
+import agent_ui as ui
 
 
 class Sandbox:
@@ -151,8 +152,7 @@ except ValueError as error:
 """
 
 
-def file_operation(operation, arguments, *, sandbox, debug=False):
-    arguments = {key: core.resolve(value, debug=debug) for key, value in arguments.items()}
+def file_operation(operation, arguments, *, sandbox):
     result = sandbox.run(
         [sys.executable, "-I", "-S", "-c", FILE_WORKER],
         payload=json.dumps([operation, arguments]),
@@ -168,12 +168,12 @@ def file_operation(operation, arguments, *, sandbox, debug=False):
     return core.LabeledValue(output["value"], core.PRIVATE_TRUSTED)
 
 
-def read(path, *, sandbox, debug=False):
-    path = (sandbox.workspace / Path(core.resolve(path, debug=debug)).expanduser()).resolve()
+def read(path, *, sandbox):
+    path = (sandbox.workspace / Path(path).expanduser()).resolve()
     if path.is_relative_to(sandbox.workspace):
-        return file_operation("read", {"path": str(path)}, sandbox=sandbox, debug=debug)
+        return file_operation("read", {"path": str(path)}, sandbox=sandbox)
 
-    label = approve_read(path)
+    label = ui.approve_read(path)
     result = sandbox.run(
         [sys.executable, "-I", "-S", "-c", APPROVED_READ, str(path)],
         allowed_read=path,
@@ -181,33 +181,9 @@ def read(path, *, sandbox, debug=False):
     if result.returncode != 0:
         raise ValueError("Approved outside read failed; only regular UTF-8 files can be read.")
 
-    if debug:
-        core.debug_label("approved read", json.dumps(str(path)), label)
+    core.trace("approved read", json.dumps(str(path)), label)
 
     return core.LabeledValue(json.loads(result.stdout)["value"], label, expose=True)
-
-
-def approve_read(path):
-    core.tool_line(f"Read outside workspace: {json.dumps(str(path))}")
-    core.tool_line("[d] Deny (default)")
-    core.tool_line("[u] Read as untrusted. The conversation becomes untrusted; edits and shell are blocked.")
-    core.tool_line("[t] Trust this read. Keep the conversation's current trust.")
-    core.tool_line("Both reads stay private. Trusting this read does not clear earlier untrusted input.")
-
-    while True:
-        try:
-            choice = input(core.color("│ Choose [d/u/t] (d): ", "2;33")).strip().lower()
-        except EOFError:
-            choice = "d"
-
-        if choice in ("", "d", "deny"):
-            raise core.PolicyError("Outside read denied by user.")
-        if choice in ("u", "untrusted"):
-            return core.PRIVATE_UNTRUSTED
-        if choice in ("t", "trust"):
-            return core.PRIVATE_TRUSTED
-
-        core.tool_line("Choose d, u, or t.")
 
 
 APPROVED_READ = """
@@ -226,21 +202,18 @@ print(json.dumps({"value": value}))
 """
 
 
-def write(path, content, *, sandbox, debug=False):
-    return file_operation("write", {"path": path, "content": content}, sandbox=sandbox, debug=debug)
+def write(path, content, *, sandbox):
+    return file_operation("write", {"path": path, "content": content}, sandbox=sandbox)
 
 
-def edit(path, old, new, *, sandbox, debug=False):
-    return file_operation("edit", {"path": path, "old": old, "new": new}, sandbox=sandbox, debug=debug)
+def edit(path, old, new, *, sandbox):
+    return file_operation("edit", {"path": path, "old": old, "new": new}, sandbox=sandbox)
 
 
-def shell(command, *, sandbox, debug=False):
-    try:
-        result = sandbox.run(["/bin/bash", "--noprofile", "--norc", "-c", command])
+def shell(command, *, sandbox):
+    result = sandbox.run(["/bin/bash", "--noprofile", "--norc", "-c", command])
 
-        return core.LabeledValue(f"Exit code: {result.returncode}\n{result.stdout}", core.PRIVATE_TRUSTED)
-    except subprocess.TimeoutExpired:
-        return core.LabeledValue("Error: command timed out after 60 seconds.", core.PRIVATE_TRUSTED)
+    return core.LabeledValue(f"Exit code: {result.returncode}\n{result.stdout}", core.PRIVATE_TRUSTED)
 
 
 TOOL_POLICIES = {
@@ -254,27 +227,17 @@ TOOL_POLICIES = {
 
 
 INSTRUCTIONS = (
-    "You are a coding agent working in an approved project directory. Use relative paths. read, "
-    "write, edit, and shell all run inside a macOS sandbox. The workspace and scratch directory are "
-    "writable. Runtime paths outside the workspace are read-only. Network and communication with "
-    "other apps are blocked. Use read for outside files: it asks the user to deny the read, read "
-    "as untrusted, or trust that read. This permission applies only to that read; shell access "
-    "does not change. If shell cannot read an outside file, use read to request approval. "
-    "Reading as untrusted exposes the text and makes the conversation untrusted. "
-    "Trusting a read preserves earlier conversation labels. Both choices keep the data private. "
-    "Edits happen in place in the approved project. The starting files were approved by the user. "
-    "Workspace reads and shell results are private/trusted and "
-    "returned directly, so you can read, edit, run tests, and repeat. Python and basic system "
-    "commands are available; dependencies cannot be downloaded. Untrusted imports are hidden behind "
-    "references such as "
+    "You are a coding agent in an approved workspace. Use relative paths. File and shell tools run "
+    "in a macOS sandbox: workspace/scratch writes, runtime reads, no network or access to other apps. "
+    "Edits happen in place. Workspace reads and shell output are private/trusted and visible. "
+    "Python and basic system commands are available; dependencies cannot be downloaded. "
+    "Use read for outside files, including when shell cannot access them. The user chooses deny, "
+    "untrusted, or trusted. Permission covers that read only; shell access stays unchanged. "
+    "Both choices keep data private and preserve earlier taint. An untrusted read exposes the text "
+    "and makes the conversation untrusted. write/edit require trusted paths and content; shell "
+    "requires a trusted conversation. Reading untrusted text blocks later edits and shell calls. "
+    "Untrusted references cannot be written into the workspace. You cannot approve reads or reset trust. "
     + core.REFERENCE_INSTRUCTIONS
-    + (
-        "write and edit require trusted paths AND trusted content. Untrusted imports and helper results "
-        "cannot be copied into the approved workspace. Shell accepts private data but requires a trusted "
-        "conversation. Inspecting untrusted imports blocks later writes, edits, and shell calls. "
-        "Only the user can approve an outside read; you cannot approve it yourself or reset trust. "
-    )
-    + core.BLOCKED_INSTRUCTIONS
 )
 
 
@@ -294,12 +257,11 @@ def create_agent(sandbox):
         tool_policies=TOOL_POLICIES,
         instructions=INSTRUCTIONS,
         inherit_call_integrity=True,
-        allow_import=True,
     )
 
 
 def main():
-    arguments = core.parse_arguments("Coding agent in an approved, sandboxed workspace.", workspace=True)
+    arguments = ui.parse_arguments("Coding agent in an approved, sandboxed workspace.", workspace=True)
 
     try:
         sandbox = Sandbox(arguments.workspace)
@@ -307,13 +269,10 @@ def main():
         raise SystemExit(f"Cannot start sandbox: {error}") from error
 
     try:
-        create_agent(sandbox).chat(debug=arguments.debug)
+        ui.chat(create_agent(sandbox), debug=arguments.debug)
     finally:
         sandbox.close()
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except (EOFError, KeyboardInterrupt):
-        print()
+    ui.run(main)

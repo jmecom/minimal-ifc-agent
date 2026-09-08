@@ -10,7 +10,8 @@ For a more complete and useful IFC-capable agent, see my other project, [pi-ifc]
   `sandbox-exec`, with workspace/scratch writes, runtime reads, and no network.
 
 Both use [agent_core.py](agent_core.py) for the chat loop, labels, hidden
-variables, and policy checks. Each agent supplies its tools and policies.
+variables, and policy checks. [agent_ui.py](agent_ui.py) handles terminal output,
+debug labels, and read approvals. Each agent supplies its tools and policies.
 
 Set up the environment:
 
